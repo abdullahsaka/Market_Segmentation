@@ -1,0 +1,723 @@
+---
+title: "IDS 572 Market Segmentation"
+author: "Britney Scott, Abdullah Saka"
+date: "4/3/2020"
+output:
+  pdf_document: default
+  html_document: default
+---
+```{r setup,include=FALSE}
+# Import required packages
+knitr::opts_chunk$set(fig.width=5, fig.height=3, fig.align='center')
+library(tidyverse)
+library(dplyr)
+library(magrittr)
+library(knitr)
+library(factoextra)
+library(kernlab)
+library(dbscan)
+library(cluster)
+library(readxl)
+library(rpart)
+
+#https://www.rdocumentation.org/packages/factoextra/versions/1.0.3
+#https://www.rdocumentation.org/packages/factoextra/versions/1.0.6/topics/fviz_cluster
+#https://www.rdocumentation.org/packages/stats/versions/3.6.2/topics/kmeans
+#https://www.rdocumentation.org/packages/cluster/versions/2.1.0/topics/pam
+#https://www.rdocumentation.org/packages/cluster/versions/2.1.0/topics/silhouette
+#https://www.rdocumentation.org/packages/dbscan/versions/1.1-5/topics/kNNdist
+# hclust - https://www.rdocumentation.org/packages/stats/versions/3.6.2/topics/hclust
+# agnes  -  https://www.rdocumentation.org/packages/cluster/versions/2.1.0/topics/agnes
+# kkmeans - https://www.rdocumentation.org/packages/kernlab/versions/0.9-29/topics/kkmeans
+# dbscan - https://www.rdocumentation.org/packages/dbscan/versions/1.1-5/topics/dbscan
+```
+
+# Introduction
+
+CRISA is a well-known market research company that focus on tracking consumer purchase behavior in consumer goods. In one major project, CRISA tracks about 30 product categories and within each category, about 60 – 70 brands. To track purchase behavior, CRISA has constituted about 50,000 household panels in 105 cities and towns in India, covering about 80% of the Indian urban market. Besides of this, there are 25,000 sample households selected in rural areas; however, we are working with only urban market data. The households are carefully selected using stratified sampling. The strata are defined on the basis of socio-economic status, and the market.
+
+CRISA has two categories of clients: (1) Advertising agencies who subscribe to the database services; they obtain updated data every month and use it to advise their clients on advertising and promotion strategies. (2) Consumer goods manufacturers who monitor their market share using the CRISA database.
+
+CRISA has traditionally segmented markets on the basis of purchaser demographics. They would now like to segment the market based on two key sets of variables more directly related to the purchase process and to brand loyalty:
+
+1. Purchase behavior (volume, frequency, susceptibility to discounts, and brand loyalty) 
+2. Basis of purchase (price, selling proposition)
+
+Doing so would allow CRISA to gain information about what demographic attributes are associated with different purchase behaviors and degrees of brand loyalty, and more effectively deploy promotion budgets.
+
+The better and more effective market segmentation would enable CRISA’s clients to design more cost-effective promotions targeted at appropriate segments. Thus, multiple promotions could be launched, each targeted at different market segments at different times of a year. This would result in a more cost-effective allocation of the promotion budget to different market- segments. It would also enable CRISA to design more effective customer reward systems and thereby increase brand loyalty.
+
+```{r, echo=FALSE}
+bsData <-  read.csv('mktg_segment.csv')
+
+#better to change the colNames which contain punctuation, space
+names(bsData) <- gsub("[[:punct:]]|\\s", "_", names(bsData))
+
+#The data with '%' in values are read in as 'chr' type - change these to numeric
+bsData[20:46]<-lapply(bsData[20:46],function(x)  as.numeric(sub("%", "e-2", x)))
+
+bsd<- bsData
+
+#for brLoyalty, calculate maxBr as max of purchase by different major brand (excl others)
+bsd<-bsd %>% rowwise() %>%  mutate(maxBr=max(Br__Cd__57__144, Br__Cd__55, Br__Cd__272, Br__Cd__286, Br__Cd__24, Br__Cd__481, Br__Cd__352, Br__Cd__5))
+```
+
+# Data Exploration and Cleaning
+
+We converted several categorical variables into dummy variables by applying one hot encoding to understand difference between clusters such as Mother Tangue, Gender, Children and Education.
+
+```{r,echo=FALSE}
+#Examine the data - can all attributes be considered as 'numeric'
+#summary(as.factor(bsd$FEH))
+
+#convert this to dummies, since the values are not ordinal, and remove the '0' level dummy
+bsd<-bsd %>% mutate(fehDummy=1) %>% pivot_wider(names_from = FEH, values_from = fehDummy, names_prefix = "FEH_", values_fill = list(fehDummy=0))
+bsd<- bsd %>% select(-FEH_0)  # can append this to the last line too
+
+bsd<-bsd %>% mutate(sexDummy=1) %>% pivot_wider(names_from = SEX, values_from = sexDummy, names_prefix = "SEX_", values_fill = list(sexDummy=0))
+bsd<- bsd %>% select(-SEX_0)  # can append this to the last line too
+
+bsd<-bsd %>% mutate(eduDummy=1) %>% pivot_wider(names_from = EDU, values_from = eduDummy, names_prefix = "EDU_", values_fill = list(eduDummy=0))
+bsd<- bsd %>% select(-EDU_0)  # can append this to the last line too
+
+#explore MT
+#summary(as.factor(bsd$MT))
+
+#keep levels 0, 4, 5, 10, 25 as dummies, with 0 in the dummies indicating 'other'
+bsd<- bsd %>% mutate(MT=ifelse(MT %in% c(0, 4, 5, 10, 25), MT, -1))
+bsd<-bsd %>% mutate(mtDummy=1) %>% pivot_wider(names_from = MT, values_from = mtDummy, names_prefix = "MT_", values_fill = list(mtDummy=0)) 
+bsd<- bsd %>% select(- `MT_-1`)
+
+#similarly for CHILD, leave out the level '5' for unknown
+bsd<-bsd %>% mutate(mtChild=1) %>% pivot_wider(names_from = CHILD, values_from = mtChild, names_prefix = "CHILD_", values_fill = list(mtChild=0)) %>% select(- CHILD_5) 
+```
+
+# K-Means Clustering
+
+### Purchase Behavior Variables
+
+Firstly, we built a clustering model by only using variables are related to 'Purchase behavior'. Purchasing behavior can be identified based on these attributes: the number of brands purchased, brand loyalty, the number of transactions, the number of runs purchasing same brand, volume of product and average price. We built clustering models by changing some parameters such as centers, nstart and iter.max in Kmeans model. It is shown that when we changed parameters of k-means model, there is no significant difference between models. Our baseline model is created by selecting 25 random sets and using 12 iterations.
+
+```{r,,echo=FALSE}
+#clustering on  purchase behavior varables
+set.seed(4)
+PURCHASE_BEHAVIOR <- c('No__of_Brands', 'Brand_Runs', 'Total_Volume', 'No__of__Trans', 'Value', 'Trans___Brand_Runs', 'Vol_Tran', 'Avg__Price', 'maxBr', 'Others_999')
+
+x<- bsd
+kmClus_pb<- x %>% select(PURCHASE_BEHAVIOR) %>% scale() %>% kmeans(centers=3, nstart=25,iter.max = 12)
+
+#Or create a scaled dataset for clustering, and use this
+xpb<-x %>% select(PURCHASE_BEHAVIOR) %>% scale() 
+
+KMeans3<- c("Cluster 1","Cluster 2","Cluster 3","Total Within","Between","Total")
+SumOfSquare<-round(c(kmClus_pb$withinss,kmClus_pb$tot.withinss,kmClus_pb$betweenss,kmClus_pb$totss),2)
+p<- as.data.frame(cbind(KMeans3,SumOfSquare))
+knitr::kable(p, align = c('c', 'c', 'c','c','c','c'))
+
+Clusters<- c("Cluster 1","Cluster 2","Cluster 3")
+Size<-kmClus_pb$size
+t<-as.data.frame(cbind(Clusters,Size))
+knitr::kable(t, align = c('c', 'c', 'c'))
+
+```
+
+Then, we checked characteristics of clusters to understand differences between clusters. Households size of cluster 1 is higher than other clusters (this increases the consumption such as number of brands, transactions and volume). Moreover, households in cluster 3 have higher brand loyalty than other clusters (generally consume products of same brand) and their affluence index is lower than others. Order of educational level is cluster 1>cluster 2>cluster 3. People are in cluster 1 are more educated than others. 
+
+In the light of these information, marketing strategies must be vary from clusters to clusters. For example, if you aim to reach people who have lower economic class and higher brand loyalty, you should consider households in cluster 3 and shape your marketing planning regarding pattern of cluster 3. 
+
+```{r,echo=FALSE}
+#add the cluster variable to the data and check the cluster descriptions in terms of broader set of variables
+x <- x %>% mutate(clusKM=kmClus_pb$cluster)
+table<- x %>% group_by(clusKM) %>% summarise_at(c('SEC', 'HS', 'Affluence_Index', 'maxBr', 'No__of_Brands', 'No__of__Trans', 'Brand_Runs', 'Total_Volume'), mean, )  
+knitr::kable(table,col.names=c("Cluster","SEC","HS","Affluence","maxBr","No of Brands", "No of Trans", "Brand Runs", "Volume"), align=c('c','c','c','c','c','c','c','c','c'))
+```
+
+After,we drew cluster plot by using fviz package. It can be clearly seen that clustering model is not optimal since clusters are overlapping. This model was not able to segment households successfully in intersection area.
+
+```{r,echo=FALSE}
+#visualize the cluster - based on variables used for clustering
+fviz_cluster(kmClus_pb, data=x %>% select(PURCHASE_BEHAVIOR),main='Clusters=3')
+```
+
+Then, we applied both elbow and silhoutte method to decide the number of clusters in the model. According to elbow method, we can say that best k value is 6. Besides of this, Silhoutte method determined the number of clusters as 4. As a result, we selected the number of clusters as 4 since if we increase the number of clusters, scope of the business can not be easily managed by marketing teams. 
+
+```{r, echo=FALSE}
+#par(mfrow=c(1,2))
+#how many clusters is best
+fviz_nbclust(xpb, kmeans, method = "wss")
+fviz_nbclust(xpb, kmeans, method = "silhouette",)
+```
+
+This plot shows clustering model when we apply 4 different clusters regarding elbow and silhoutte model. This model is slightly better than previous model, still not best (clusters are overlapping).
+
+```{r,,echo=FALSE}
+x<- bsd
+kmClus_pb<- x %>% select(PURCHASE_BEHAVIOR) %>% scale() %>% kmeans(centers=4, nstart=25,iter.max = 12)
+
+#Or create a scaled dataset for clustering, and use this
+xpb<-x %>% select(PURCHASE_BEHAVIOR) %>% scale() 
+
+KMeans3<- c("Cluster 1","Cluster 2","Cluster 3","Cluster 4","Total Within","Between","Total")
+SumOfSquare<-round(c(kmClus_pb$withinss,kmClus_pb$tot.withinss,kmClus_pb$betweenss,kmClus_pb$totss),2)
+p<- as.data.frame(cbind(KMeans3,SumOfSquare))
+knitr::kable(p, align = c('c', 'c', 'c','c','c','c'))
+
+#visualize the cluster - based on variables used for clustering
+fviz_cluster(kmClus_pb, data=x %>% select(PURCHASE_BEHAVIOR),main='Clusters=4')
+```
+
+### Basis for Purchase Variables
+
+Secondly, we applied k-means clustering by using different variables. Basis of purchase variables obtains percent of volume purchased not on promotion, on promo code 6 and other than 6, proposition of beauty, health and baby products.
+
+```{r,,echo=FALSE}
+#clustering on  basis for purchase variables
+BASIS_FOR_PURCHASE <- c('Pur_Vol_No_Promo____', 'Pur_Vol_Promo_6__', 'Pur_Vol_Other_Promo__', 'Pr_Cat_1', 'Pr_Cat_2', 'Pr_Cat_3', 'PropCat_5', 'PropCat_6', 'PropCat_12','PropCat_15')
+
+x<- bsd
+kmClus_pb_basis<- x %>% select(BASIS_FOR_PURCHASE) %>% scale() %>% kmeans(centers=3, nstart=25,iter.max = 12)
+
+#Or create a scaled dataset for clustering, and use this
+xpb<-x %>% select(BASIS_FOR_PURCHASE) %>% scale() 
+
+KMeans3<- c("Cluster 1","Cluster 2","Cluster 3","Total Within","Between","Total")
+SumOfSquare<-round(c(kmClus_pb_basis$withinss,kmClus_pb_basis$tot.withinss,kmClus_pb_basis$betweenss,kmClus_pb_basis$totss),2)
+p<- as.data.frame(cbind(KMeans3,SumOfSquare))
+knitr::kable(p, align = c('c', 'c', 'c','c','c','c'))
+
+Clusters<- c("Cluster 1","Cluster 2","Cluster 3")
+Size<-kmClus_pb_basis$size
+t<-as.data.frame(cbind(Clusters,Size))
+knitr::kable(t, align = c('c', 'c', 'c'))
+```
+
+The graph below indicates that basis for purchase variables are not sufficient to segment households in comsuption of consumer goods. Clusters overlapped and so variance between clusters is small.
+
+```{r,,echo=FALSE}
+#visualize the cluster - based on variables used for clustering
+fviz_cluster(kmClus_pb_basis, data=x %>% select(PURCHASE_BEHAVIOR),main='Clusters=3')
+```
+
+Then, we tried to learn behavior differences between clusters. Households in cluster 2 have higher brand loyalty(77%) than other clusters (generally consume products of same brand) and their affluence index is lowest than others. Also, social economic status of cluster 3 is the lowest than other(almost 3.4). Order of educational level is cluster 1>cluster 3>cluster 2. People are in cluster 3 are more educated than others. Overall, households in cluster 1 and 3 shows similar pattern in consumption. 
+
+Based on these insights, marketing strategies must be vary from clusters to clusters. For instance, if you work on launching products which have medium price, you should target households in cluster 2 and build your marketing strategies matching with characteristics of cluster 2. 
+
+```{r,echo=FALSE}
+#add the cluster variable to the data and check the cluster descriptions in terms of broader set of variables
+x <- x %>% mutate(clusKM=kmClus_pb_basis$cluster)
+table<- x %>% group_by(clusKM) %>% summarise_at(c('SEC', 'HS', 'Affluence_Index', 'maxBr', 'No__of_Brands', 'No__of__Trans', 'Brand_Runs', 'Total_Volume'), mean, )  
+knitr::kable(table,col.names=c("Cluster","SEC","HS","Affluence","maxBr","No of Brands", "No of Trans", "Brand Runs", "Volume"), align=c('c','c','c','c','c','c','c','c','c'))
+```
+
+Then, we applied both elbow and silhoutte method to decide the number of clusters in the model. According to elbow method, we can say that best k value is 7. Besides of this, Silhoutte method determined the number of clusters as 8. As a result, instead of using 7 or 8 for the number of clusters, we determined the number of clusters as 4 since this help managing marketing plans systematically.
+
+```{r, echo=FALSE}
+par(mfrow=c(1,2))
+#how many clusters is best
+fviz_nbclust(xpb, kmeans, method = "wss")
+fviz_nbclust(xpb, kmeans, method = "silhouette",)
+```
+
+This plot shows clustering model when we ran 4 different clusters considering elbow and silhoutte above. This model is slightly better than previous model,still not best (clusters are overlapping).
+
+```{r,echo=FALSE}
+x<- bsd
+kmClus_pb_basis<- x %>% select(PURCHASE_BEHAVIOR) %>% scale() %>% kmeans(centers=4, nstart=25,iter.max = 12)
+
+#Or create a scaled dataset for clustering, and use this
+xpb<-x %>% select(PURCHASE_BEHAVIOR) %>% scale() 
+
+KMeans3<- c("Cluster 1","Cluster 2","Cluster 3","Cluster 4","Total Within","Between","Total")
+SumOfSquare<-round(c(kmClus_pb_basis$withinss,kmClus_pb_basis$tot.withinss,kmClus_pb_basis$betweenss,kmClus_pb_basis$totss),2)
+p<- as.data.frame(cbind(KMeans3,SumOfSquare))
+knitr::kable(p, align = c('c', 'c', 'c','c','c','c'))
+
+#visualize the cluster - based on variables used for clustering
+fviz_cluster(kmClus_pb_basis, data=x %>% select(PURCHASE_BEHAVIOR),main='Clusters=4')
+```
+
+### Combined Variables
+
+Lastly, we applied k-means clustering by using combined variables in part a and part b. Combined variables includes both purchase behavior and basis for purchase variables. Tables below gives information about clustering model when we selected k as 4.
+
+```{r,,echo=FALSE,par(mfrow=c(1,2))}
+#clustering on  combined variables
+COMBINED <- c('No__of_Brands', 'Brand_Runs', 'Total_Volume', 'No__of__Trans', 'Value', 'Trans___Brand_Runs', 'Vol_Tran', 'Avg__Price', 'maxBr', 'Others_999','Pur_Vol_No_Promo____', 'Pur_Vol_Promo_6__', 'Pur_Vol_Other_Promo__', 'Pr_Cat_1', 'Pr_Cat_2', 'Pr_Cat_3', 'PropCat_5', 'PropCat_6', 'PropCat_12','PropCat_15')
+
+x<- bsd
+kmClus_pb_combined<- x %>% select(COMBINED) %>% scale() %>% kmeans(centers=3, nstart=25,iter.max = 12)
+
+#Or create a scaled dataset for clustering, and use this
+xpb<-x %>% select(COMBINED) %>% scale() 
+
+KMeans3<- c("Cluster 1","Cluster 2","Cluster 3","Total Within","Between","Total")
+SumOfSquare<-round(c(kmClus_pb_combined$withinss,kmClus_pb_combined$tot.withinss,kmClus_pb_combined$betweenss,kmClus_pb_combined$totss),2)
+p<- as.data.frame(cbind(KMeans3,SumOfSquare))
+knitr::kable(p, align = c('c', 'c', 'c','c','c','c'))
+
+Clusters<- c("Cluster 1","Cluster 2","Cluster 3")
+Size<-kmClus_pb_combined$size
+t<-as.data.frame(cbind(Clusters,Size))
+knitr::kable(t, align = c('c', 'c', 'c'))
+```
+
+The graph below indicates that combined variables are slightly better than previos models,yet it is still not sufficient to segment households. Clusters overlapped(intersections are not easy to identify) and so variance between clusters is small.
+
+```{r,,echo=FALSE}
+#visualize the cluster - based on variables used for clustering
+fviz_cluster(kmClus_pb_combined, data=x %>% select(COMBINED),main='Clusters=3')
+```
+
+Then, we checked characteristics of clusters whether we see vital differences between clusters. Households size of cluster is similar to each other. Moreover, households in cluster 3 have higher brand loyalty than other clusters (hence transaction of brand runs is also highest) and their affluence index is lower than others. Order of educational level is cluster 1>cluster 2>cluster 3. People are in cluster 1 are more educated than others. Overall, households in cluster 1 and 3 shows similar pattern in consumption. 
+
+Based on this information, marketing strategies must be vary from clusters to clusters. For example, if you launch premium products into the market, you have to reach people who have higher affluence index and education level which corresponds to cluster 1. (purchasing power is higher and not price oriented, quality oriented)
+
+```{r,echo=FALSE}
+#add the cluster variable to the data and check the cluster descriptions in terms of broader set of variables
+x <- x %>% mutate(clusKM=kmClus_pb_combined$cluster)
+table<- x %>% group_by(clusKM) %>% summarise_at(c('SEC', 'HS', 'Affluence_Index', 'maxBr', 'No__of_Brands', 'No__of__Trans', 'Brand_Runs', 'Total_Volume'), mean, )  
+knitr::kable(table,col.names=c("Cluster","SEC","HS","Affluence","maxBr","No of Brands", "No of Trans", "Brand Runs", "Volume"), align=c('c','c','c','c','c','c','c','c','c'))
+```
+
+Then, we applied both elbow and silhoutte method to do benchmarking among clusters. According to elbow method, we can say that best k value is 6. Besides of this, Silhoutte method determined the number of clusters as 9. As a result, we determined the number of clusters as 6.
+
+```{r, echo=FALSE}
+par(mfrow=c(1,2))
+#how many clusters is best
+fviz_nbclust(xpb, kmeans, method = "wss")
+fviz_nbclust(xpb, kmeans, method = "silhouette",)
+```
+
+This plot shows clustering model when we apply 6 different clusters regarding benchmarking analysis above (also within clusters SSQ is higher and between clusters SSQ is lower than previous model).This model is slightly better than previous model,still not best(clusters are overlapping).
+
+```{r,,echo=FALSE}
+x<- bsd
+kmClus_pb_combined<- x %>% select(COMBINED) %>% scale() %>% kmeans(centers=6, nstart=25,iter.max = 12)
+
+#Or create a scaled dataset for clustering, and use this
+xpb<-x %>% select(COMBINED) %>% scale() 
+
+KMeans3<- c("Cluster 1","Cluster 2","Cluster 3","Cluster 4","Cluster 5","Cluster 6","Total Within","Between","Total")
+SumOfSquare<-round(c(kmClus_pb_combined$withinss,kmClus_pb_combined$tot.withinss,kmClus_pb_combined$betweenss,kmClus_pb_combined$totss),2)
+p<- as.data.frame(cbind(KMeans3,SumOfSquare))
+knitr::kable(p, align = c('c', 'c', 'c','c','c','c'))
+
+#visualize the cluster - based on variables used for clustering
+fviz_cluster(kmClus_pb_combined, data=x %>% select(COMBINED),main='Clusters=6')
+```
+# K-Medoids Clustering
+
+### Purchase Behavior Variables
+
+Several issues occur when using the k-means clustering. For example, the k-means algorithm is very sensitive to outliers and noise since the mean statistic is sensitive to these occurences. In order to address these issues, we chose to explore k-medoids clustering as a second clustering technique. 
+
+First, we will apply this clustering using the purchasing behavior. We started by using 3 clusters again. Here is a plot of the clusters using this choice.
+
+```{r,echo=FALSE}
+##PAM - Partitioning around mediods
+
+#clustering on  purchase behavior varables
+PURCHASE_BEHAVIOR <- c('No__of_Brands', 'Brand_Runs', 'Total_Volume', 'No__of__Trans', 'Value', 'Trans___Brand_Runs', 'Vol_Tran', 'Avg__Price', 'maxBr', 'Others_999')
+x<- bsd
+xpb<-x %>% select(PURCHASE_BEHAVIOR) %>% scale() 
+
+pam_pb_1<-pam(xpb, k=3, metric = "euclidean")
+
+knitr::kable(pam_pb_1$clusinfo)
+
+fviz_cluster(pam_pb_1)
+```
+
+This plot does not vary much visually from the k-means algorithm. Once again, though, we wanted to varify what the optimal number of clusters actually is. Therefore, we chose to use both the elbow and silhouette methods to check for the optimal number of clusters. The elbow method does not demonstrate a clear elbow, but the silhouette method suggests 4 clusters to be optimal. Because of this, we will run the k-medoids again using 4 clusters instead of 3.
+
+```{r, echo=FALSE}
+par(mfrow=c(2,1))
+#how many clusters is best
+fviz_nbclust(xpb, cluster::pam, method = "wss")
+fviz_nbclust(xpb, cluster::pam, method = "silhouette")
+```
+The graph below indicates that k medoids model works slightly better than k mean regarding basis for purchase variables,yet there is a still overlapping so distance between clusters is small.
+
+```{r,echo=FALSE}
+pam_pb_2<-pam(xpb, k=4, metric = "euclidean")
+
+knitr::kable(pam_pb_2$clusinfo)
+
+fviz_cluster(pam_pb_2)
+```
+
+According to table, cluster 2 has higher affluence index and lower brand loyalty than other clusters. On the other hand, households in cluster 3 is the most loyal customers in this market and brand runs metric is the lowest among all households. Cluster 1 and Cluster 4 have similar consumption pattern(slight changes). Household size of cluster 4 is the highest; hence total consumption vary significantly from other clusters.
+```{r,echo=FALSE}
+#add the cluster variable to the data and check the cluster descriptions in terms of broader set of variables
+x <- x %>% mutate(clusPAM=pam_pb_2$clustering)
+table<- x %>% group_by(clusPAM) %>% summarise_at(c('SEC', 'HS', 'Affluence_Index', 'maxBr', 'No__of_Brands', 'No__of__Trans', 'Brand_Runs', 'Total_Volume'), mean, )  
+knitr::kable(table,col.names=c("Cluster","SEC","HS","Affluence","maxBr","No of Brands", "No of Trans", "Brand Runs", "Volume"), align=c('c','c','c','c','c','c','c','c','c'))
+```
+
+### Basis for Purchase Variables
+
+Now, just like with k means, we will cluster on the basis for purchase variables. Once again, three clusters will be used as a baseline. Here is the result of the three clusters:
+
+```{r, echo=FALSE}
+#clustering on  basis for purchase variables
+BASIS_FOR_PURCHASE <- c('Pur_Vol_No_Promo____', 'Pur_Vol_Promo_6__', 'Pur_Vol_Other_Promo__', 'Pr_Cat_1', 'Pr_Cat_2', 'Pr_Cat_3', 'PropCat_5', 'PropCat_6', 'PropCat_12','PropCat_15')
+x<- bsd
+xbp<-x %>% select(BASIS_FOR_PURCHASE) %>% scale() 
+
+pam_bp3<-pam(xbp, k=3, metric = "euclidean")
+knitr::kable(pam_bp3$clusinfo)
+
+fviz_cluster(pam_bp3)
+```
+
+The silhouette method clearly indicates that 2 clusters would be optimal in the case of clustering on basis for purchase variables. 
+
+```{r, echo=FALSE}
+par(mfrow=c(1,2))
+#how many clusters is best
+fviz_nbclust(xbp, cluster::pam, method = "wss")
+fviz_nbclust(xbp, cluster::pam, method = "silhouette")
+```
+
+Running the pam algorithm with only two clusters yields clusters of very different sizes, as is visible below.
+
+```{r, echo=FALSE}
+#perhaps 4?
+pam_bp2<-pam(xbp, k=4, metric = "euclidean")
+knitr::kable(pam_bp2$clusinfo)
+
+fviz_cluster(pam_bp2)
+```
+This table shows differences between clusters. For example, if we want to launch premium soap, we should try to understand cluster 1 and cluster 2. Nonetheless, when we want to increase sales of low priced products,we have to focus cluster 2 and cluster 4.
+```{r,echo=FALSE}
+#add the cluster variable to the data and check the cluster descriptions in terms of broader set of variables
+x <- x %>% mutate(clusPAM=pam_bp2$clustering)
+table<- x %>% group_by(clusPAM) %>% summarise_at(c('SEC', 'HS', 'Affluence_Index', 'maxBr', 'No__of_Brands', 'No__of__Trans', 'Brand_Runs', 'Total_Volume'), mean, )  
+knitr::kable(table,col.names=c("Cluster","SEC","HS","Affluence","maxBr","No of Brands", "No of Trans", "Brand Runs", "Volume"), align=c('c','c','c','c','c','c','c','c','c'))
+```
+
+### Combined Variables
+
+```{r, echo=FALSE}
+#clustering on  combined variables
+COMBINED <- c('No__of_Brands', 'Brand_Runs', 'Total_Volume', 'No__of__Trans', 'Value', 'Trans___Brand_Runs', 'Vol_Tran', 'Avg__Price', 'maxBr', 'Others_999','Pur_Vol_No_Promo____', 'Pur_Vol_Promo_6__', 'Pur_Vol_Other_Promo__', 'Pr_Cat_1', 'Pr_Cat_2', 'Pr_Cat_3', 'PropCat_5', 'PropCat_6', 'PropCat_12','PropCat_15')
+
+x<- bsd
+xc<-x %>% select(COMBINED) %>% scale() 
+
+pam_c3<-pam(xc, k=3, metric = "euclidean")
+knitr::kable(pam_c3$clusinfo)
+
+fviz_cluster(pam_c3)
+```
+
+```{r, echo=FALSE}
+par(mfrow=c(1,2))
+#how many clusters is best
+fviz_nbclust(xc, cluster::pam, method = "wss")
+fviz_nbclust(xc, cluster::pam, method = "silhouette")
+```
+
+```{r, echo=FALSE}
+# 8 is optimal, but this is so much - 4 from elbow is good
+pam_c8<-pam(xc, k=4, metric = "euclidean")
+knitr::kable(pam_c8$clusinfo)
+
+fviz_cluster(pam_c8)
+```
+
+```{r, echo=FALSE}
+x <- x %>% mutate(clusPAM=pam_c8$clustering)
+table<- x %>% group_by(clusPAM) %>% summarise_at(c('SEC', 'HS', 'Affluence_Index', 'maxBr', 'No__of_Brands', 'No__of__Trans', 'Brand_Runs', 'Total_Volume'), mean, )  
+knitr::kable(table,col.names=c("Cluster","SEC","HS","Affluence","maxBr","No of Brands", "No of Trans", "Brand Runs", "Volume"), align=c('c','c','c','c','c','c','c','c','c'))
+```
+
+# Hierarchical Clustering
+
+As a third clustering algorithm, we chose to use hierarchical clustering.
+
+### Purchase Behavior Variables
+
+We implemented agglomerative hierarchical clustering by using different distance techniques such as weighted, complete and Ward's method. 
+
+We chose the clustering based on Ward's method rather than complete method. Size of clusters based on complete and weighted measure vary significantly. Most of households are in cluster 1 (86%). However, clustering with Ward's method creates more balanced clusters. Besides,we can check the agglomerative coefficient, which measures the amount of clustering structure found (values closer to 1 suggest strong clustering structure). We can clearly say that Ward's method is better than others on the basis of this dataset.
+
+```{r, echo=FALSE}
+xpb<-x %>% select(PURCHASE_BEHAVIOR) %>% scale() 
+xdist <- dist(xpb, method = "euclidean")
+
+hierC_pb_ag_s <- agnes(xdist, method = "weighted" )
+hierC_pb_ag_c <- agnes(xdist, method = "complete" )
+hierC_pb_ag_w <- agnes(xdist, method = "ward" )
+
+agg_coef_weighted <- hierC_pb_ag_s$ac
+agg_coef_complete <- hierC_pb_ag_c$ac
+agg_coef_ward <- hierC_pb_ag_w$ac
+Value <- round(c(agg_coef_weighted,agg_coef_complete,agg_coef_ward),2)
+Method <- c("Agg. Coef of Weighted","Agg. Coef of Complete","Agg. Coef of Ward")
+z<- data.frame(cbind(Method,Value))
+knitr::kable(z, align = c('c', 'c', 'c'))
+
+cut3_hierC_pb_ac_s <- cutree(hierC_pb_ag_s, k = 3)
+z <- table(cut3_hierC_pb_ac_s)
+
+knitr::kable(z, align = c('c', 'c', 'c'),col.names=c('Cluster label based on weighted method','Size'))
+
+cut3_hierC_pb_ac_c <- cutree(hierC_pb_ag_c, k = 3)
+z <- table(cut3_hierC_pb_ac_c)
+
+knitr::kable(z, align = c('c', 'c', 'c'),col.names=c('Cluster label based on Complete method','Size'))
+
+cut3_hierC_pb_ac_w <- cutree(hierC_pb_ag_w, k = 3)
+t<- table(cut3_hierC_pb_ac_w)
+
+knitr::kable(t, align = c('c', 'c', 'c'),col.names=c("Cluster label based on Ward's method","Size"))
+
+# Ward is best
+```
+
+We checked for the optimal number of clusters using the hierarchical method.
+
+```{r, echo=FALSE}
+#par(mfrow=c(1,2))
+#how many clusters is best
+fviz_nbclust(xpb, hcut, method = "wss")
+fviz_nbclust(xpb, hcut, method = "silhouette",)
+```
+
+This determines 5 clusters to be good based on both the elbow and silhouette methods. However, we determined the number of clusters as 4 since when we increase the number of clusters, size of several clusters is smaller. This does not add any significant value to business. (adding value of focusing some households in small clusters is not worth)
+
+```{r, echo=FALSE}
+cut4_hierC_pb_ac_w <- cutree(hierC_pb_ag_w, k = 4)
+z <- table(cut4_hierC_pb_ac_w)
+
+knitr::kable(z, align = c('c', 'c', 'c'),col.names=c('Cluster label k=4','Size'))
+
+cut5_hierC_pb_ac_w <- cutree(hierC_pb_ag_w, k = 5)
+t<- table(cut5_hierC_pb_ac_w)
+
+knitr::kable(t, align = c('c', 'c', 'c'),col.names=c("Cluster label k=5","Size"))
+```
+
+When we check features of households, we can say that cluster 2 has much higher affluence index but less brand loyalty (households in cluster 2 purchase different brands in the market). On the other hand, cluster 1 has higher brand loyalty in this market. Households size of cluster 4 is much higher than others (volume of consumption is also higher)
+
+```{r,echo=FALSE}
+#add the cluster variable to the data and check the cluster descriptions in terms of broader set of variables
+x <- x %>% mutate(clusH=cut4_hierC_pb_ac_w)
+table<- x %>% group_by(clusH) %>% summarise_at(c('SEC', 'HS', 'Affluence_Index', 'maxBr', 'No__of_Brands', 'No__of__Trans', 'Brand_Runs', 'Total_Volume'), mean, )  
+knitr::kable(table,col.names=c("Cluster","SEC","HS","Affluence","maxBr","No of Brands", "No of Trans", "Brand Runs", "Volume"), align=c('c','c','c','c','c','c','c','c','c'))
+```
+
+First table shows cluster distribution of observations visually and second one indicates dendogram of hierarchical clustering method which was built by using Ward's method with 4 clusters.
+
+```{r, echo=FALSE}
+fviz_cluster(list(data=xpb,cluster=cut3_hierC_pb_ac_w), main="agnes-ward")
+
+fviz_dend(hierC_pb_ag_w, k=3, color_labels_by_k = FALSE, rect=TRUE, main="agnes - Wards")
+```
+
+### Basis for Purchase Variables
+
+Secondly, we applied hierarchical clustering by using different variables. Basis of purchase variables obtains percent of volume purchased not on promotion, on promo code 6 and other than 6, proposition of beauty, health and baby products. 
+
+We chose the clustering based on Ward's method rather than complete method. Size of clusters based on complete and weighted measure vary significantly. Most of households are in cluster 1 (99%). However, clustering with Ward's method creates more balanced clusters. We can clearly say that Ward's method is better than others on the basis of this dataset.
+
+```{r, echo=FALSE}
+xpb<-x %>% select(BASIS_FOR_PURCHASE) %>% scale() 
+xdist <- dist(xpb, method = "euclidean")
+
+hierC_pb_ag_s_2 <- agnes(xdist, method = "weighted" )
+hierC_pb_ag_c_2 <- agnes(xdist, method = "complete" )
+hierC_pb_ag_w_2 <- agnes(xdist, method = "ward" )
+
+agg_coef_weighted_purc <- hierC_pb_ag_s_2$ac
+agg_coef_complete_purc <- hierC_pb_ag_c_2$ac
+agg_coef_ward_purc <- hierC_pb_ag_w_2$ac
+Value <- round(c(agg_coef_weighted_purc,agg_coef_complete_purc,agg_coef_ward_purc),2)
+Method <- c("Agg. Coef of Weighted","Agg. Coef of Complete","Agg. Coef of Ward")
+z_purc<- data.frame(cbind(Method,Value))
+knitr::kable(z_purc, align = c('c', 'c', 'c'))
+
+cut3_hierC_pb_ac_s <- cutree(hierC_pb_ag_s_2, k = 3)
+z <- table(cut3_hierC_pb_ac_s)
+
+knitr::kable(z, align = c('c', 'c', 'c'),col.names=c('Cluster label based on weighted method','Size'))
+
+
+cut3_hierC_pb_ac_c <- cutree(hierC_pb_ag_c_2, k = 3)
+z <- table(cut3_hierC_pb_ac_c)
+
+knitr::kable(z, align = c('c', 'c', 'c'),col.names=c('Cluster label based on Complete method','Size'))
+
+cut3_hierC_pb_ac_w <- cutree(hierC_pb_ag_w_2, k = 3)
+t<- table(cut3_hierC_pb_ac_w)
+
+knitr::kable(t, align = c('c', 'c', 'c'),col.names=c("Cluster label based on Ward's method","Size"))
+```
+
+Using these clustering variables, we again checked for the optimal clusters using both silhouette and elbow methods. The elbow and silhouette methods indicate 7-8 clusters as optimal, but this is a large amount from a business perspective. 
+
+```{r, echo=FALSE}
+#par(mfrow=c(1,2))
+#how many clusters is best
+fviz_nbclust(xpb, hcut, method = "wss")
+fviz_nbclust(xpb, hcut, method = "silhouette",)
+```
+
+Instead, we decided to try smaller numbers of clusters and compare. In the first table, cluster 1 dominates other clusters, thus, 4 clusters are better than others. On the other hand, when we increase the number of clusters, some clusters are smaller and that is not sufficient for market segmentation. As a result, we determined the number of clusters as 4 since clusters are more balanced than others (concentrating feasible customer segments is much better).
+
+```{r, echo=FALSE}
+xpb<-x %>% select(BASIS_FOR_PURCHASE) %>% scale() 
+xdist <- dist(xpb, method = "euclidean")
+
+hierC_pb_ag_w <- agnes(xdist, method = "ward" )
+
+cut3_hierC_pb_ac_w <- cutree(hierC_pb_ag_w_2, k = 3)
+t<- table(cut3_hierC_pb_ac_w)
+
+knitr::kable(t, align = c('c', 'c', 'c'),col.names=c("Cluster label k=3","Size"))
+
+cut4_hierC_pb_ac_w <- cutree(hierC_pb_ag_w_2, k = 4)
+t<- table(cut4_hierC_pb_ac_w)
+
+knitr::kable(t, align = c('c', 'c', 'c'),col.names=c("Cluster label k=4","Size"))
+
+cut5_hierC_pb_ac_w <- cutree(hierC_pb_ag_w_2, k = 5)
+t<- table(cut5_hierC_pb_ac_w)
+
+knitr::kable(t, align = c('c', 'c', 'c'),col.names=c("Cluster label k=5","Size"))
+```
+
+First table shows cluster distribution of observations; hence clusters are overlapping (features was not able to seperate observations properly). Second one indicates dendogram of hierarchical clustering method which was built by using Ward's method with 4 clusters.
+
+```{r, echo=FALSE}
+fviz_cluster(list(data=xpb,cluster=cut4_hierC_pb_ac_w), main="agnes-ward")
+
+fviz_dend(hierC_pb_ag_w, k=4, color_labels_by_k = FALSE, rect=TRUE, main="agnes - Wards")
+```
+
+The following table indicates the differences between the clusters. Cluster 2 shows significant differences than other clusters (higher brand loyalty and less affluence index). Nonetheless,cluster 3 and 4 shows similar consumption behaviors.
+
+```{r,echo=FALSE}
+#add the cluster variable to the data and check the cluster descriptions in terms of broader set of variables
+x <- x %>% mutate(clusH=cut4_hierC_pb_ac_w)
+table<- x %>% group_by(clusH) %>% summarise_at(c('SEC', 'HS', 'Affluence_Index', 'maxBr', 'No__of_Brands', 'No__of__Trans', 'Brand_Runs', 'Total_Volume'), mean, )  
+knitr::kable(table,col.names=c("Cluster","SEC","HS","Affluence","maxBr","No of Brands", "No of Trans", "Brand Runs", "Volume"), align=c('c','c','c','c','c','c','c','c','c'))
+```
+
+### Combined Variables 
+
+Lastly, we applied hierarchical clustering by using combined variables in part a and part b. Combined variables includes both purchase behavior and basis for purchase variables.
+
+We used Ward's method to measure distance between points (Ward performs well) and cut the tree by checking dendogram. Overall, we can use 5 clusters to segment households and then concentrate on characteristics of these clusters.
+
+```{r, echo=FALSE}
+xpb<-x %>% select(COMBINED) %>% scale() 
+xdist <- dist(xpb, method = "euclidean")
+
+hierC_pb_ag_w <- agnes(xdist, method = "ward" )
+
+cut3_hierC_pb_ac_w <- cutree(hierC_pb_ag_w, k = 3)
+t<- table(cut3_hierC_pb_ac_w)
+
+agg_coef_ward_comb <- hierC_pb_ag_w$ac
+Value <- round(c(agg_coef_ward_comb),2)
+Method <- c("Agg. Coef of Ward")
+z_purc<- data.frame(cbind(Method,Value))
+knitr::kable(z_purc, align = c('c'))
+
+knitr::kable(t, align = c('c', 'c', 'c'),col.names=c("Cluster label k=3","Size"))
+
+cut4_hierC_pb_ac_w <- cutree(hierC_pb_ag_w, k = 4)
+t<- table(cut4_hierC_pb_ac_w)
+
+knitr::kable(t, align = c('c', 'c', 'c'),col.names=c("Cluster label k=4","Size"))
+
+cut5_hierC_pb_ac_w <- cutree(hierC_pb_ag_w, k = 5)
+t<- table(cut5_hierC_pb_ac_w)
+
+knitr::kable(t, align = c('c', 'c', 'c'),col.names=c("Cluster label k=5","Size"))
+```
+
+We also checked the elbow and silhouette method for the combined clustering variables. Elbow doesn't give a super distinctive result in this case. Silhouette indicates that we should use 2 clusters, but this is very few, so we still feel a few more are better.
+
+```{r, echo=FALSE}
+#par(mfrow=c(1,2))
+#how many clusters is best
+fviz_nbclust(xpb, hcut, method = "wss")
+fviz_nbclust(xpb, hcut, method = "silhouette",)
+```
+
+First table shows cluster distribution of observations; hence clusters are overlapping (features was not able to seperate observations properly). Second one indicates dendogram of hierarchical clustering method which was built by using Ward's method with 4 clusters.
+
+```{r, echo=FALSE}
+fviz_cluster(list(data=xpb,cluster=cut4_hierC_pb_ac_w), main="agnes-ward")
+
+fviz_dend(hierC_pb_ag_w, k=4, color_labels_by_k = FALSE, rect=TRUE, main="agnes - Wards")
+```
+This table shows differences between clusters based on combined variables. It can be clearly seen that behavior of cluster 1 and 2 are totally different. Cluster 2 has the lowest affluence index and the highest brand loyalty.(focus this group for low priced products). For premium products, you have to consider households in cluster 1 and cluster 3.
+```{r,echo=FALSE}
+#add the cluster variable to the data and check the cluster descriptions in terms of broader set of variables
+x <- x %>% mutate(clusH=cut4_hierC_pb_ac_w)
+table<- x %>% group_by(clusH) %>% summarise_at(c('SEC', 'HS', 'Affluence_Index', 'maxBr', 'No__of_Brands', 'No__of__Trans', 'Brand_Runs', 'Total_Volume'), mean, )  
+knitr::kable(table,col.names=c("Cluster","SEC","HS","Affluence","maxBr","No of Brands", "No of Trans", "Brand Runs", "Volume"), align=c('c','c','c','c','c','c','c','c','c'))
+```
+
+#Best Segmentation and Clustering Model
+
+We implemented 3 different clustering methods such as k-means, k-medioids and hierarchical clustering. The clusters obtained from these procedures are slightly different since modeling approach varies from model to model. For example, similarity of k-means is based on means. However, k-means is sensitive to outliers and hence k-medioids calculate distance matrix regarding median. Besides, agglomerative hieararchical clustering starting with the maximum number of clusters (observations) and then continue until one cluster is left. We have a chance to cut the dendogram at the proper level. Advantage of hierarchical clustering is that this model gives an analysis more in depth than other models.
+
+We decided to use a few number of clusters such as 3 and 4 to segment households, because we did not find any benefit from using higher number of clusters in terms of business interpretation. Besides, the total number of households is in order of 100, considerably small dataset, which also justtifies using small number of clusters.
+
+Overall, k-medoids performs slightly better than k-means. Hierarchical clustering and k-medoids shows similar performance by considering distribution of observations. We selected k-medoids model with 4 clusters for best segmentation and clustering. This shows the segmnetation of the households in the soap market.
+
+```{r, echo=FALSE}
+x <- x %>% mutate(clusPAM=pam_c8$clustering)
+table<- x %>% group_by(clusPAM) %>% summarise_at(c('SEC', 'HS', 'Affluence_Index', 'maxBr', 'No__of_Brands', 'No__of__Trans', 'Brand_Runs', 'Total_Volume'), mean, )  
+knitr::kable(table,col.names=c("Cluster","SEC","HS","Affluence","maxBr","No of Brands", "No of Trans", "Brand Runs", "Volume"), align=c('c','c','c','c','c','c','c','c','c'))
+```
+The table below states that cluster 3 has the lowest affluence index and higher brand loyalty. Cluster 1 and 2 has similar households size, yet their brand loyalty is different. Cluster 4 purchases less than other clusters(household size is lower). This model explains consumer behaviors more and add a vital value to marketing planning.
+
+For one ‘best’ segmentation, we built a decision tree by predicting labels of observations. We used information gain as splitting criteria and determined minsplit and complexity parameter as (40,0.001). Then, we checked variable importance as this table shows importance score of each feature:
+```{r,echo=False,fig.align=center}
+#assign clustering labels as dependent variable
+x$label=pam_c8$clustering 
+
+x$label <- as.factor(x$label)
+
+#Splitting data into training/testing sets using random sampling, Training: 70%, Testing: 30%
+#Training: 70%, Testing: 30%
+set.seed(5)
+nr<-nrow(x)
+trnIndex = sample(1:nr, size = round(0.7*nr), replace=FALSE)
+lcdfTrn <- x[trnIndex, ] 
+lcdfTst <- x[-trnIndex, ]
+
+lcDT1 <- rpart(label ~., data=subset(lcdfTrn,select=c(COMBINED,'label')), method="class", parms = list(split = "information"), control = rpart.control(minsplit = 40, cp=0.001))
+
+a <- lcDT1$variable.importance
+knitr::kable(a, align = c('c','c'))
+```
+According to this table,'Avg__Price','Pr_Cat_3','Brand_Runs','Pr_Cat_1' and 'No__of__Trans' are the most 5 important variable to predict clustering label accurately. This shows that the most important variables are combination of purchase behavior and basis for purchase. 
+
+This table demonstrates confusion matrix of training data and train accuracy:
+```{r,echo=False,fig.align=center}
+# Training accuracy
+predTrn=predict(lcDT1, lcdfTrn, type='class')
+q <- table(lcdfTrn$label,predTrn)
+knitr::kable(q, align = c('c', 'c'))
+Metric1 <- c("Training Accuracy")
+Result1 <- c(round(mean(predTrn==lcdfTrn$label),4))
+p1 <- as.data.frame(cbind(Metric1, Result1))
+knitr::kable(p1, align = c('c', 'c'))
+```
+This table shows confusion matrix of testing data and testing accuracy:
+```{r,echo=False,fig.align=center}
+# Testing accuracy
+predTst=predict(lcDT1, lcdfTst, type='class')
+table(lcdfTst$label,predTst)
+Metric2 <- c("Testing Accuracy")
+Result2 <- c(round(mean(predTst==lcdfTst$label),4))
+p2 <- as.data.frame(cbind(Metric2, Result2))
+knitr::kable(p2, align = c('c', 'c'))
+```
