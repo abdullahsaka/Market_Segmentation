@@ -1,3 +1,4 @@
+This is the project that I did with my team in 'Data Mining' course as part of my Master's Program.
 
 Instructions:
 
